@@ -1,67 +1,89 @@
 """
 项目主运行流程
 串联数据、模型、对抗攻击、结果统计，供团队联调使用
+你的工作：导入队友写好的三个函数，依次调用，拼接完整流程
 """
 import torch
 import json
 from torchvision.models import resnet50, ResNet50_Weights
+
+# 1. 导入队友写的三个函数（三个模块都是队友开发）
+from data_tool import load_cifar10
+from predict_tool import model_predict
+from eval_tool import compute_accuracy
+
+# 导入你自己完成的攻击模块
 from attack_generator import AttackGenerator
 
-def create_dummy_data(num_samples=64, batch_size=16):
-    data = torch.rand(num_samples, 3, 64, 64)
-    labels = torch.randint(0, 1000, (num_samples,))
-    return data, labels
 
 def main():
+    # 设备初始化
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("当前运行设备：", device)
 
+    # 加载图像识别模型
     model = resnet50(weights=ResNet50_Weights.DEFAULT).to(device).eval()
     print("ResNet50 模型加载完成")
 
-    attacker = AttackGenerator(eps=8/255)
+    # 初始化你实现的攻击工具
+    attacker = AttackGenerator(eps=8 / 255)
     print("攻击工具初始化完成，支持FGSM、PGD")
 
-    all_imgs, all_labels = create_dummy_data(num_samples=64)
-    all_imgs = all_imgs.to(device)
-    all_labels = all_labels.to(device)
+    # ======================
+    # 第一处：调用队友函数 load_cifar10
+    # ======================
+    test_loader = load_cifar10(batch_size=16)
 
-    total_success = 0
-    total_num = len(all_imgs)
-    batch = 16
+    total_flip = 0
+    all_sample_num = 0
     report_data = []
 
-    for start in range(0, total_num, batch):
-        end = min(start + batch, total_num)
-        batch_img = all_imgs[start:end]
-        batch_label = all_labels[start:end]
+    # 循环分批读取图片
+    for batch_img, batch_label in test_loader:
+        batch_img = batch_img.to(device)
+        batch_label = batch_label.to(device)
+        all_sample_num += batch_img.shape[0]
 
+        # 调用你写的攻击方法生成对抗样本
         adv_img = attacker.generate_fgsm(model, batch_img, batch_label)
 
-        pred_origin = model(batch_img).argmax(dim=1)
-        pred_adv = model(adv_img).argmax(dim=1)
-        success_mask = (pred_adv != pred_origin)
-        total_success += int(success_mask.sum())
+        # ======================
+        # 第二处：调用队友函数 model_predict
+        # ======================
+        pred_origin = model_predict(model, batch_img)
+        pred_adv = model_predict(model, adv_img)
 
-        for i in range(len(batch_img)):
+        # ======================
+        # 第三处：调用队友函数 compute_accuracy
+        # ======================
+        batch_rate, batch_flip, batch_len = compute_accuracy(pred_origin, pred_adv)
+        total_flip += batch_flip
+
+        # 记录每一条样本结果
+        for i in range(batch_len):
             report_data.append({
                 "origin_label": int(pred_origin[i]),
                 "adv_label": int(pred_adv[i]),
-                "attack_success": bool(success_mask[i])
+                "attack_success": bool(pred_adv[i] != pred_origin[i])
             })
 
-    success_rate = total_success / total_num
-    print(f"FGSM攻击完成，总样本{total_num}，成功扰动{total_success}个，成功率：{success_rate:.2%}")
+    # 整体攻击成功率汇总
+    total_success_rate = total_flip / all_sample_num
+    print(f"FGSM攻击完成，总样本{all_sample_num}，成功扰动{total_flip}个，成功率：{total_success_rate:.2%}")
 
-    out_json = "fgsm_result.json"
-    with open(out_json, "w", encoding="utf-8") as f:
+    # 保存实验结果json文件
+    save_path = "fgsm_result.json"
+    with open(save_path, "w", encoding="utf-8") as f:
         json.dump({
             "attack_type": "FGSM",
-            "eps": 8/255,
-            "success_rate": success_rate,
+            "eps": 8 / 255,
+            "total_samples": all_sample_num,
+            "success_count": total_flip,
+            "success_rate": total_success_rate,
             "detail": report_data
         }, f, indent=2)
-    print(f"测试报告已保存至 {out_json}")
+    print(f"测试报告已保存至 {save_path}")
+
 
 if __name__ == "__main__":
     main()
