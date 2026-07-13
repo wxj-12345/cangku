@@ -17,6 +17,10 @@ from attack_generator import AttackGenerator
 
 
 def main():
+    import time
+    # 记录程序整体开始时间
+    total_start = time.time()
+
     # 设备初始化
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("当前运行设备：", device)
@@ -38,7 +42,7 @@ def main():
     all_sample_num = 0
     report_data = []
 
-    # 循环分批读取图片
+    # 循环分批读取图片（删除了多余嵌套循环）
     for batch_img, batch_label in test_loader:
         batch_img = batch_img.to(device)
         batch_label = batch_label.to(device)
@@ -83,6 +87,11 @@ def main():
             "detail": report_data
         }, f, indent=2)
     print(f"测试报告已保存至 {save_path}")
+    # 全部数据处理完成后，计算并打印总运行时长
+    total_run_time = time.time() - total_start
+    print("========================================")
+    print(f"项目完整运行总时长：{total_run_time:.2f} 秒")
+    print("========================================")
 
 
 if __name__ == "__main__":
