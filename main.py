@@ -1,98 +1,75 @@
-"""
-项目主运行流程
-串联数据、模型、对抗攻击、结果统计，供团队联调使用
-你的工作：导入队友写好的三个函数，依次调用，拼接完整流程
-"""
 import torch
 import json
+import time
 from torchvision.models import resnet50, ResNet50_Weights
-
-# 1. 导入队友写的三个函数（三个模块都是队友开发）
 from data_tool import load_cifar10
-from predict_tool import model_predict
+from predict_tool import ProtectedModel, model_predict
+from attack_generator import AttackGenerator
 from eval_tool import compute_accuracy
 
-# 导入你自己完成的攻击模块
-from attack_generator import AttackGenerator
-
-
 def main():
-    import time
-    # 记录程序整体开始时间
-    total_start = time.time()
-
-    # 设备初始化
+    start_time = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("当前运行设备：", device)
-
-    # 加载图像识别模型
-    model = resnet50(weights=ResNet50_Weights.DEFAULT).to(device).eval()
-    print("ResNet50 模型加载完成")
-
-    # 初始化你实现的攻击工具
-    attacker = AttackGenerator(eps=8 / 255)
-    print("攻击工具初始化完成，支持FGSM、PGD")
-
-    # ======================
-    # 第一处：调用队友函数 load_cifar10
-    # ======================
-    test_loader = load_cifar10(batch_size=16)
-
-    total_flip = 0
-    all_sample_num = 0
+    
+    # 1. 初始化受保护的模型（配额 1000）
+    raw_model = resnet50(weights=ResNet50_Weights.DEFAULT).to(device)
+    model = ProtectedModel(raw_model, max_queries=1000)
+    
+    # 2. 加载数据（采样率 0.1 满足萌的要求，1000次查询约能跑100张图）
+    test_loader = load_cifar10(batch_size=16, sample_ratio=0.1)
+    
+    # 3. 初始化攻击器
+    attacker = AttackGenerator(model, eps=8/255)
+    
+    total_flip, total_samples = 0, 0
     report_data = []
 
-    # 循环分批读取图片（删除了多余嵌套循环）
-    for batch_img, batch_label in test_loader:
-        batch_img = batch_img.to(device)
-        batch_label = batch_label.to(device)
-        all_sample_num += batch_img.shape[0]
+    print(f"开始评测... 目标：推理次数 <= 1000")
 
-        # 调用你写的攻击方法生成对抗样本
-        adv_img = attacker.generate_fgsm(model, batch_img, batch_label)
+    try:
+        for batch_img, batch_label in test_loader:
+            batch_img, batch_label = batch_img.to(device), batch_label.to(device)
+            
+            # 每一个 Batch 运行前，预判是否会撞线（16张图 * 10次/张 = 160次消耗）
+            if model.query_count + 160 > 1000:
+                print(">>> 剩余配额不足以完成完整 Batch，提前停止以守住红线。")
+                break
 
-        # ======================
-        # 第二处：调用队友函数 model_predict
-        # ======================
-        pred_origin = model_predict(model, batch_img)
-        pred_adv = model_predict(model, adv_img)
+            # 生成对抗样本（触发查询）
+            adv_img = attacker.generate_pgd(batch_img, batch_label)
+            
+            # 原始预测与对抗预测（触发查询）
+            pred_origin = model_predict(model, batch_img)
+            pred_adv = model_predict(model, adv_img)
+            
+            # 统计
+            _, flip, b_len = compute_accuracy(pred_origin, pred_adv)
+            total_flip += flip
+            total_samples += b_len
+            
+            print(f"已处理样本: {total_samples} | 当前累计推理次数: {model.query_count}")
 
-        # ======================
-        # 第三处：调用队友函数 compute_accuracy
-        # ======================
-        batch_rate, batch_flip, batch_len = compute_accuracy(pred_origin, pred_adv)
-        total_flip += batch_flip
+    except RuntimeError as e:
+        if "QUERY_LIMIT_EXCEEDED" in str(e):
+            print(">>> [警告] 推理次数触碰 1000 次红线，系统自动熔断停止！")
+        else:
+            raise e
 
-        # 记录每一条样本结果
-        for i in range(batch_len):
-            report_data.append({
-                "origin_label": int(pred_origin[i]),
-                "adv_label": int(pred_adv[i]),
-                "attack_success": bool(pred_adv[i] != pred_origin[i])
-            })
+    # 4. 结算报告
+    total_time = time.time() - start_time
+    success_rate = total_flip / total_samples if total_samples > 0 else 0
+    
+    print("\n" + "="*40)
+    print("         XH202616 任务结算报告")
+    print("="*40)
+    print(f"【莹】推理总次数: {model.query_count}次 (限额1000) -> {'✅ 合规' if model.query_count <= 1000 else '❌ 超标'}")
+    print(f"【佳】运行总时长: {total_time:.2f}秒 (限额300) -> {'✅ 合规' if total_time <= 300 else '❌ 超标'}")
+    print(f"【综合】攻击成功率: {success_rate:.2%}")
+    print("="*40)
 
-    # 整体攻击成功率汇总
-    total_success_rate = total_flip / all_sample_num
-    print(f"FGSM攻击完成，总样本{all_sample_num}，成功扰动{total_flip}个，成功率：{total_success_rate:.2%}")
-
-    # 保存实验结果json文件
-    save_path = "fgsm_result.json"
-    with open(save_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "attack_type": "FGSM",
-            "eps": 8 / 255,
-            "total_samples": all_sample_num,
-            "success_count": total_flip,
-            "success_rate": total_success_rate,
-            "detail": report_data
-        }, f, indent=2)
-    print(f"测试报告已保存至 {save_path}")
-    # 全部数据处理完成后，计算并打印总运行时长
-    total_run_time = time.time() - total_start
-    print("========================================")
-    print(f"项目完整运行总时长：{total_run_time:.2f} 秒")
-    print("========================================")
-
+    # 保存 JSON
+    with open("final_report.json", "w") as f:
+        json.dump({"queries": model.query_count, "success_rate": success_rate, "time": total_time}, f)
 
 if __name__ == "__main__":
     main()
