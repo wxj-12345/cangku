@@ -1,83 +1,35 @@
-import random
-import numpy as np
 import torch
+import torch.nn as nn
+from torchvision import transforms
 
+class ProtectedModel(nn.Module):
+    def __init__(self, base_model, max_queries=1000):
+        super().__init__()
+        self.model = base_model
+        self.query_count = 0
+        self.max_queries = max_queries
+        # CIFAR-10 标准归一化（这是提升识别准确率和攻击成功率的关键）
+        self.normalize = transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+
+    def forward(self, x):
+        batch_size = x.shape[0]
+        
+        # 硬熔断检查：如果本次推理会导致总数超过1000，则报错
+        if self.query_count + batch_size > self.max_queries:
+            raise RuntimeError("QUERY_LIMIT_EXCEEDED")
+        
+        self.query_count += batch_size
+        
+        # 对输入进行归一化后传给原始模型
+        x_norm = self.normalize(x)
+        return self.model(x_norm)
 
 def model_predict(model, images):
-     """
-     模型预测函数，main.py 直接导入调用
-     :param model: 加载好的 resnet50 模型
-     :param images: 图片张量 [batch,3,H,W]
-     :return: 每张图片预测类别索引 tensor
-     """
-     # 推理模式，关闭梯度节省资源
-     model.eval()
-     with torch.no_grad():
-         outputs = model(images)
-         # 取概率最大的类别
-         pred_labels = torch.argmax(outputs, dim=1)
-     return pred_labels
- # 配套模型加载包装类（替代你之前不匹配的ModelWrapper）
-
-
-class ModelWrapper:
     """
-    AI模型统一接口
-    当前为Stub版本（占位实现）
-    后续替换为真实PyTorch模型
+    供 main.py 调用的预测函数
     """
-
-    def __init__(self):
-        # 后续加载的模型
-        self.model = None
-
-        # 推理次数统计
-        self.predict_counter = 0
-
-        # 最大推理次数限制
-        self.max_predict = 1000
-
-    def load_model(self, model_path=None):
-        """
-        后续加载PyTorch模型
-        当前为空实现   1
-        """
-        self.model = None
-
-    def reset_counter(self):
-        """
-        重置推理计数
-        """
-        self.predict_counter = 0
-
-    def get_features(self, vm_state):
-        """
-        根据VM状态提取特征
-
-        当前返回随机特征
-        后续替换为真实特征工程   2
-        """
-
-        return np.random.rand(64)
-
-    def predict(self, features):
-        """
-        模型推理
-
-        当前返回随机动作
-        后续替换为真实模型输出   3
-        """
-
-        if self.predict_counter >= self.max_predict:
-            raise RuntimeError("Inference limit exceeded (>1000).")
-
-        self.predict_counter += 1
-
-        action = random.randint(0, 9)
-
-        confidence = random.random()
-
-        return {
-            "action": action,
-            "confidence": confidence
-        }
+    model.eval()
+    with torch.no_grad():
+        # 这里会触发 ProtectedModel 的 forward，从而计数
+        outputs = model(images)
+        return torch.argmax(outputs, dim=1)
