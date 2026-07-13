@@ -2,35 +2,15 @@ import foolbox as fb
 import torch
 
 class AttackGenerator:
-    def __init__(self, eps=8/255):
+    def __init__(self, model_wrapper, eps=8/255):
         self.eps = eps
-        self.fgsm_attack = fb.attacks.FGSM()
-        self.pgd_attack = fb.attacks.LinfProjectedGradientDescentAttack(steps=10, random_start=True)
+        # 初始化绑定模型，不要在循环里反复初始化 fb.PyTorchModel，否则运行极慢
+        self.fmodel = fb.PyTorchModel(model_wrapper, bounds=(0, 1))
+        
+        # 将 steps 设为 7。每张图生成消耗 8 次查询。
+        self.pgd_attack = fb.attacks.LinfProjectedGradientDescentAttack(steps=7, random_start=True)
 
-    def generate_fgsm(self, model, images, labels):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        images = images.to(device)
-        labels = labels.to(device)
-
-        fb_model = fb.PyTorchModel(model, bounds=(0, 1))
-
-        adv_img, _ , _= self.fgsm_attack(fb_model, images, labels, epsilons=self.eps)
-        adv_img = torch.clamp(adv_img, 0.0, 1.0)
-        return adv_img
-
-
-        # 2. 生成之后，再限制像素范围 (Clamp)
-        adv_img = torch.clamp(adv_img, 0.0, 1.0)
-        # --- 修改结束 ---
-
-        return adv_img
-
-    def generate_pgd(self, model, images, labels):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        images = images.to(device)
-        labels = labels.to(device)
-
-        fb_model = fb.PyTorchModel(model, bounds=(0, 1))
-        adv_img = self.pgd_attack(fb_model, images, labels, epsilons=self.eps)
-        adv_img = torch.clamp(adv_img, 0.0, 1.0)
-        return adv_img
+    def generate_pgd(self, images, labels):
+        # 内部调用会消耗 model_wrapper 的 query_count
+        _, adv_img, _ = self.pgd_attack(self.fmodel, images, labels, epsilons=self.eps)
+        return torch.clamp(adv_img, 0.0, 1.0)
