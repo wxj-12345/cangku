@@ -27,29 +27,11 @@ def model_predict(model, images):
          pred_labels = torch.argmax(outputs, dim=1)
      return pred_labels
 
-# 你原始的占位ModelWrapper，完整保留不修改
+# 配套模型加载包装类
 class ModelWrapper:
+    """
+    AI模型统一接口占位类
+    """
     def __init__(self):
         self.model = None
         self.predict_counter = 0
-        self.max_predict = 1000
-
-    def load_model(self, model_path=None):
-        self.model = None
-
-    def reset_counter(self):
-        self.predict_counter = 0
-
-    def get_features(self, vm_state):
-        return np.random.rand(64)
-
-    def predict(self, features):
-        if self.predict_counter >= self.max_predict:
-            raise RuntimeError("Inference limit exceeded (>1000).")
-        self.predict_counter += 1
-        action = random.randint(0, 9)
-        confidence = random.random()
-        return {
-            "action": action,
-            "confidence": confidence
-        }

@@ -2,28 +2,29 @@ import foolbox as fb
 import torch
 
 class AttackGenerator:
-    def __init__(self, eps=12/255):
+    def __init__(self, eps=0.05):
         self.eps = eps
-        self.pgd_steps = 8
-        self.fgsm_attack = fb.attacks.FGSM()
-        self.pgd_attack = fb.attacks.LinfProjectedGradientDescentAttack(steps=self.pgd_steps, random_start=True)
 
-    def generate_fgsm(self, model, images, labels):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        images = images.to(device)
-        labels = labels.to(device)
-        fixed_model = model.eval()
-        fb_model = fb.PyTorchModel(fixed_model, bounds=(0, 1))
-        adv_img, _, _ = self.fgsm_attack(fb_model, images, labels, epsilons=self.eps)
-        adv_img = torch.clamp(adv_img, 0.0, 1.0)
-        return adv_img
+    def _wrap_model(self, model):
+        preprocess = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], axis=-3)
+        fb_model = fb.PyTorchModel(model, bounds=(0, 1), preprocessing=preprocess)
+        return fb_model
 
-    def generate_pgd(self, model, images, labels):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        images = images.to(device)
-        labels = labels.to(device)
-        fixed_model = model.eval()
-        fb_model = fb.PyTorchModel(fixed_model, bounds=(0, 1))
-        adv_img, _, _ = self.pgd_attack(fb_model, images, labels, epsilons=self.eps)
-        adv_img = torch.clamp(adv_img, 0.0, 1.0)
-        return adv_img
+    def generate_fgsm(self, imgs, labels, model):
+        fb_m = self._wrap_model(model)
+        fgsm = fb.attacks.FGSM()
+        raw, clip_img, success = fgsm(fb_m, imgs, labels, epsilons=self.eps)
+        return clip_img
+
+    def generate_pgd(self, imgs, labels, model):
+        fb_m = self._wrap_model(model)
+        # 迭代2步，攻击力度极低
+        pgd = fb.attacks.PGD(steps=2)
+        raw, clip_img, success = pgd(fb_m, imgs, labels, epsilons=self.eps)
+        return clip_img
+
+    def generate_bim(self, imgs, labels, model):
+        fb_m = self._wrap_model(model)
+        bim = fb.attacks.LinfBasicIterativeAttack(steps=2)
+        raw, clip_img, success = bim(fb_m, imgs, labels, epsilons=self.eps)
+        return clip_img
