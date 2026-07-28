@@ -1,5 +1,4 @@
 import numpy as np
-import torch
 
 def compute_accuracy(origin_pred, adv_pred):
     origin_pred = np.array(origin_pred)
@@ -7,9 +6,9 @@ def compute_accuracy(origin_pred, adv_pred):
     diff = origin_pred != adv_pred
     flip_count = diff.sum()
     total = len(origin_pred)
-    attack_success_rate = flip_count / total
+    attack_success_rate = float(flip_count / total)
     clean_acc = 1.0
-    adv_acc = 1 - attack_success_rate
+    adv_acc = float(1 - attack_success_rate)
     return attack_success_rate, int(flip_count), int(total), clean_acc, adv_acc
 
 def compute_migration_retention(source_adv_acc, target_adv_acc):
@@ -21,12 +20,13 @@ def compute_migration_retention(source_adv_acc, target_adv_acc):
     else:
         retention = target_adv_acc / source_adv_acc
         migrate_fail = retention < 0.9
-    # 转为Python原生bool，彻底解决JSON序列化报错
     return round(retention, 4), bool(migrate_fail)
 
 def calc_fluctuation(acc_list):
     if len(acc_list) < 2:
         return 0.0
     arr = np.array(acc_list)
-    fluct = abs(np.max(arr) - np.min(arr))
-    return round(fluct, 4)
+    max_val = np.max(arr)
+    min_val = np.min(arr)
+    fluct = abs(max_val - min_val)
+    return round(float(fluct), 4)

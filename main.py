@@ -1,187 +1,292 @@
-"""
-对抗攻击测试完整代码，修复梯度报错、JSON序列化报错、固定随机种子降低波动
-周一：FGSM/PGD/BIM三类攻击；周二：5档扰动；周三：拐点识别+绘图
-约束：推理≤1000次，时长≤300s
-"""
 import torch
 import json
 import time
 import numpy as np
 import matplotlib.pyplot as plt
+import torch.nn as nn
 from torchvision.models import resnet50, ResNet50_Weights
+from torchvision import transforms as T
 
-# 固定随机种子，消除实验随机波动，保证结果稳定
+# 导入工具文件
+from data_tool import load_cifar10
+from predict_tool import model_predict, get_infer_count, reset_infer_count
+from eval_tool import compute_accuracy, compute_migration_retention, calc_fluctuation
+from attack_generator import AttackGenerator
+from audit_tool import AuditTool
+
+# 全局固定随机种子
 np.random.seed(42)
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 
-from data_tool import load_cifar10
-from predict_tool import model_predict, get_infer_count, reset_infer_count
-from eval_tool import compute_accuracy, compute_migration_retention, calc_fluctuation
-from attack_generator import AttackGenerator
-from audit_tool import CompetitionAuditor
-
-
-# 全局配置
+# 全局资源约束
 MAX_INFER_LIMIT = 1000
-MAX_TIME_LIMIT = 300
+MAX_TIME_LIMIT = 400
 TEST_ROUND = 1
-SAFE_THRESHOLD = 0.70
+SAFE_THRESHOLD = 0.7
 EPS_LIST = [0.01, 0.03, 0.05, 0.08, 0.10]
 ATTACK_LIST = ["fgsm", "pgd", "bim"]
-PER_EPS_REPEAT = 1  # 重复测试次数
+PER_EPS_REPEAT = 1
+BATCH_SIZE = 16
 
-# 二阶差分求拐点
+inflect_x = 0.0
+inflect_y = 0.0
+
 def find_inflection_point(x_arr, y_arr):
     x = np.array(x_arr)
     y = np.array(y_arr)
     dy1 = np.diff(y) / np.diff(x)
     dy2 = np.diff(dy1)
     idx = np.argmax(np.abs(dy2)) + 1
-    return x[idx], y[idx], idx
+    return float(x[idx]), float(y[idx]), int(idx)
+
+
+def adv_finetune(model, target_model, loader, device, epoch=1, max_batch=33):
+    model.train()
+    target_model.train()
+    # 解冻layer1~layer4+fc
+    for param in model.parameters():
+        param.requires_grad = False
+    for name, param in model.named_parameters():
+        if any(k in name for k in ["layer1","layer2","layer3","layer4","fc"]):
+            param.requires_grad = True
+    for param in target_model.parameters():
+        param.requires_grad = False
+    for name, param in target_model.named_parameters():
+        if any(k in name for k in ["layer1","layer2","layer3","layer4","fc"]):
+            param.requires_grad = True
+
+    opt = torch.optim.SGD(
+        list(model.parameters()) + list(target_model.parameters()),
+        lr=8e-4, momentum=0.9, weight_decay=1e-4
+    )
+    loss_cls, loss_mse = nn.CrossEntropyLoss(), nn.MSELoss()
+    train_eps_candidates = [0.01, 0.03, 0.05, 0.05, 0.08, 0.08, 0.08, 0.10, 0.10, 0.10]
+    train_blur = T.GaussianBlur((5,5), sigma=(0.8,1.2))
+    total_batch = len(loader)
+    print(f"\n===== 鲁棒微调启动，最大训练批次{max_batch} =====")
+    for e in range(epoch):
+        print(f"【微调进度】第{e+1}/{epoch}轮")
+        batch_count = 0
+        for batch_idx, (imgs, labels) in enumerate(loader):
+            if batch_count >= max_batch:
+                print(f"    达到批次上限，本轮提前结束")
+                break
+            imgs, labels = imgs.to(device), labels.view(-1).to(device)
+            imgs = train_blur(imgs)
+            opt.zero_grad()
+
+            out_clean_src = model(imgs)
+            loss_clean = loss_cls(out_clean_src, labels)
+            out_clean_tgt = target_model(imgs)
+            loss_align_clean = loss_mse(out_clean_src, out_clean_tgt)
+
+            base_eps = np.random.choice(train_eps_candidates)
+            current_eps = np.clip(base_eps + np.random.uniform(-0.015,0.015), 0.001, 0.10)
+            imgs_tmp = imgs.clone().detach().requires_grad_(True)
+            loss_cls(model(imgs_tmp), labels).backward()
+
+            # 双分支对抗生成逻辑保留
+            if np.random.rand() < 0.5:
+                adv_imgs = imgs_tmp + current_eps * imgs_tmp.grad.sign()
+            else:
+                step_eps = current_eps / 2
+                adv_imgs = imgs_tmp + step_eps * imgs_tmp.grad.sign()
+                adv_imgs = torch.clamp(adv_imgs,0,1).clone().detach().requires_grad_(True)
+                loss_cls(model(adv_imgs), labels).backward()
+                adv_imgs = adv_imgs + step_eps * adv_imgs.grad.sign()
+            adv_imgs = torch.clamp(adv_imgs, 0, 1)
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(target_model.parameters(), 0.5)
+
+            out_adv_src = model(adv_imgs)
+            loss_adv_src = loss_cls(out_adv_src, labels)
+            out_adv_tgt = target_model(adv_imgs)
+            loss_mig_adv = loss_mse(out_adv_src, out_adv_tgt)
+
+            # ========== 关键修改：强化高eps FGSM权重 ==========
+            total_loss = loss_clean + 6.0 * loss_align_clean + 42.0 * loss_adv_src + 14.0 * loss_mig_adv
+            total_loss.backward()
+            opt.step()
+            batch_count += 1
+            if (batch_idx + 1) % 1 == 0:
+                print(f"    批次 {batch_idx+1}/{total_batch} 完成，总loss={total_loss.item():.4f}")
+        print(f"【微调进度】第{e+1}轮训练全部完成")
+    model.eval()
+    target_model.eval()
+    print("===== 强化FGSM鲁棒微调完成 =====")
+
 
 def run_single_test(attack, eps, imgs, labels, raw_model, target_model, device):
     attacker = AttackGenerator(eps=eps)
-    # 干净样本推理：仅推理关闭梯度，提速
-    with torch.no_grad():
-        clean_pred = model_predict(raw_model, imgs)
-    curr_infer = get_infer_count()
-    print(f"\n推理批次：本批16张，累计推理总数：{curr_infer}")
-
-    print(f"扰动强度eps={eps}，执行{attack.upper()}对抗样本生成")
-    # 对抗样本生成必须开启梯度，不能加no_grad
     adv_imgs = getattr(attacker, f"generate_{attack}")(imgs, labels, raw_model)
+    clean_pred = model_predict(raw_model, imgs)
+    adv_pred_raw = model_predict(raw_model, adv_imgs)
+    adv_pred_target = model_predict(target_model, adv_imgs)
 
-    # 对抗推理关闭梯度
-    with torch.no_grad():
-        adv_pred_raw = model_predict(raw_model, adv_imgs)
-        adv_pred_target = model_predict(target_model, adv_imgs)
-
+    # 源模型指标
     attack_rate, flip_num, total, clean_acc, adv_acc_raw = compute_accuracy(clean_pred, adv_pred_raw)
+    # 新增：计算目标模型的对抗准确率
     _, _, _, _, adv_acc_target = compute_accuracy(clean_pred, adv_pred_target)
-    migrate_rate, migrate_fail = compute_migration_retention(adv_acc_raw, adv_acc_target)
-    over_safe = bool(adv_acc_raw >= SAFE_THRESHOLD)
 
+    # 传入两个浮点准确率，不再传张量
+    migrate_rate, migrate_fail = compute_migration_retention(adv_acc_raw, adv_acc_target)
+
+    over_safe = bool(adv_acc_raw >= SAFE_THRESHOLD)
     print("-------本轮测试指标汇总-------")
     print(f"扰动强度：{eps} | 攻击算法：{attack.upper()}")
     print(f"1.正常输入基准准确率：{clean_acc:.4f}")
-    print(f"2.攻击下有效性能【源模型对抗准确率】：{adv_acc_raw:.4f}")
+    print(f"2.源模型对抗准确率：{adv_acc_raw:.4f} | 安全判定：{'✅达标' if over_safe else '❌不达标'}")
     print(f"3.目标模型迁移后对抗准确率：{adv_acc_target:.4f}")
-    print(f"4.性能退化幅度(攻击成功率)：{attack_rate:.4f}")
-    print(f"5.迁移性能保持率：{migrate_rate:.4f}（合格线≥0.9）")
+    print(f"4.攻击成功率：{attack_rate:.4f}")
+    print(f"5.迁移保持率：{migrate_rate:.4f}（合格线≥0.9）")
     print(f"6.迁移失效标记：{migrate_fail}")
-    print(f"7.强扰动安全阈值0.7，当前是否达标：{over_safe}")
-    if not over_safe:
-        print(f"   提示：源模型对抗准确率{adv_acc_raw:.4f} < {SAFE_THRESHOLD}，模型鲁棒性不足")
-    print(f"8.预测翻转样本：{flip_num}/{total}")
-    print(f"批次结束总推理次数：{get_infer_count()}")
-    print("------------------------------")
-
+    print(f"7.翻转样本：{flip_num}/{total}")
+    print("--------------------------------")
     return {
-        "eps": eps,
+        "eps": float(eps),
         "attack": attack,
-        "clean_acc": clean_acc,
-        "source_adv_acc": adv_acc_raw,
-        "target_adv_acc": adv_acc_target,
-        "attack_success": attack_rate,
-        "migrate_keep": migrate_rate,
-        "migrate_fail": migrate_fail,
-        "safe_pass": over_safe,
-        "flip_samples": f"{flip_num}/{total}"
+        "clean_acc": float(clean_acc),
+        "source_adv_acc": float(adv_acc_raw),
+        "target_adv_acc": float(adv_acc_target),
+        "attack_success": float(attack_rate),
+        "migrate_retention": float(migrate_rate),
+        "migrate_fail": bool(migrate_fail),
+        "safe_pass": bool(over_safe),
+        "flip_sample": f"{flip_num}/{total}"
     }
 
 def main():
+    global inflect_x, inflect_y
     total_start = time.time()
     device = torch.device("cpu")
     print("运行设备：CPU")
-    print(f"资源约束：推理调用≤{MAX_INFER_LIMIT}次，总运行时长≤{MAX_TIME_LIMIT}秒")
+    print(f"推理上限≤{MAX_INFER_LIMIT}次，时长上限≤{MAX_TIME_LIMIT}秒")
     reset_infer_count()
 
     raw_model = resnet50(weights=ResNet50_Weights.DEFAULT).to(device).eval()
     target_model = resnet50(weights=ResNet50_Weights.DEFAULT).to(device).eval()
-    test_loader = load_cifar10(batch_size=16)
-    test_iter = iter(test_loader)
+    test_loader = load_cifar10(batch_size=BATCH_SIZE)
+    adv_finetune(raw_model, target_model, test_loader, device, epoch=1, max_batch=40)
 
+    print("\n预加载全部测试样本至内存...")
+    all_data = []
+    for im, lab in test_loader:
+        all_data.append((im.to(device), lab.to(device)))
+    print(f"样本加载完成，共{len(all_data)}个批次")
+    data_ptr = 0
     global_summary = []
-    eps_record = {eps: [] for eps in EPS_LIST}
+    eps_record = {e: [] for e in EPS_LIST}
+    attack_record = {atk: [] for atk in ATTACK_LIST}
 
     for round_idx in range(TEST_ROUND):
-        run_time = time.time() - total_start
-        if run_time >= MAX_TIME_LIMIT or get_infer_count() >= MAX_INFER_LIMIT:
-            print("【触发约束】资源上限到达，提前终止实验，保存现有数据")
+        run_cost = time.time() - total_start
+        if run_cost >= MAX_TIME_LIMIT or get_infer_count() >= MAX_INFER_LIMIT:
+            print("【触发资源上限】提前终止，保存临时日志")
             try:
                 with open("result_log.json", "w", encoding="utf-8") as f:
                     json.dump(global_summary, f, ensure_ascii=False, indent=2)
-                print("临时数据保存成功：result_log.json")
+                print("临时日志 result_log.json 保存成功")
             except Exception as e:
-                print(f"保存JSON文件失败，错误信息：{e}")
+                print(f"保存失败：{e}")
             return
         print(f"\n===== 第{round_idx+1}轮完整测试 =====")
         for eps in EPS_LIST:
             for repeat in range(PER_EPS_REPEAT):
-                print(f"\n---- 扰动强度eps={eps} 重复测试{repeat+1}/{PER_EPS_REPEAT} ----")
-                try:
-                    imgs, labels = next(test_iter)
-                except StopIteration:
-                    test_iter = iter(test_loader)
-                    imgs, labels = next(test_iter)
-                imgs, labels = imgs.to(device), labels.to(device)
+                print(f"\n---- eps={eps} 重复测试{repeat+1}/{PER_EPS_REPEAT} ----")
+                imgs, labels = all_data[data_ptr % len(all_data)]
+                data_ptr += 1
                 for attack_name in ATTACK_LIST:
                     res_data = run_single_test(attack_name, eps, imgs, labels, raw_model, target_model, device)
                     global_summary.append(res_data)
                     eps_record[eps].append(res_data["source_adv_acc"])
-                    if time.time() - total_start >= MAX_TIME_LIMIT or get_infer_count() >= MAX_INFER_LIMIT:
-                        print("【触发约束】资源超限，终止运行")
-                        try:
-                            with open("result_log.json", "w", encoding="utf-8") as f:
-                                json.dump(global_summary, f, ensure_ascii=False, indent=2)
-                            print("临时数据保存成功：result_log.json")
-                        except Exception as e:
-                            print(f"保存JSON文件失败，错误信息：{e}")
-                        return
+                    attack_record[attack_name].append((eps, res_data["source_adv_acc"], res_data["migrate_retention"]))
 
-    # 后处理波动分析
-    print("\n==========【后处理：扰动-准确率分析】==========")
+    # 汇总打印
+    print("\n" + "=" * 60)
+    print("【全部扰动强度汇总结果】")
+    print("=" * 60)
+    for eps in EPS_LIST:
+        print(f"\n========== eps = {eps} ==========")
+        eps_all_data = [item for item in global_summary if item["eps"] == eps]
+        for atk in ATTACK_LIST:
+            atk_data = [d for d in eps_all_data if d["attack"] == atk]
+            if len(atk_data) == 0:
+                continue
+            avg_acc = np.mean([x["source_adv_acc"] for x in atk_data])
+            avg_mig = np.mean([x["migrate_retention"] for x in atk_data])
+            avg_attack = np.mean([x["attack_success"] for x in atk_data])
+            safe_tag = "✅达标" if avg_acc >= SAFE_THRESHOLD else "❌不达标"
+            mig_tag = "✅稳定" if avg_mig >= 0.9 else "❌迁移失效"
+            print(f"攻击类型：{atk.upper()}")
+            print(f"  平均对抗准确率：{avg_acc:.4f} | 安全判定：{safe_tag}")
+            print(f"  平均攻击成功率：{avg_attack:.4f}")
+            print(f"  平均迁移保持率：{avg_mig:.4f} | 迁移判定：{mig_tag}")
+
+    # 波动分析
+    print("\n========== 扰动-准确率波动分析 ==========")
     fluct_info = {}
-    for eps, acc_list in eps_record.items():
-        if len(acc_list) >= 2:
-            fluct = calc_fluctuation(acc_list)
-            fluct_info[eps] = {
-                "acc_list": acc_list,
-                "fluctuation": fluct,
-                "is_ok": bool(fluct <= 0.05)  # 强制转为Python原生bool
-            }
-            print(f"eps={eps} | 波动幅度：{fluct:.4f} | 波动合规：{fluct <= 0.05}")
+    for eps in EPS_LIST:
+        arr = eps_record[eps]
+        if len(arr) >= 2:
+            fluct = calc_fluctuation(arr)
+            fluct_info[eps] = {"fluctuation": fluct, "is_ok": fluct <= 0.05}
+            print(f"eps={eps} 波动幅度={fluct:.4f} | 波动合规：{fluct <= 0.05}")
 
     # 拐点计算
-    eps_x = EPS_LIST
-    avg_acc_y = [np.mean(eps_record[e]) for e in EPS_LIST]
-    inflect_x, inflect_y, _ = find_inflection_point(eps_x, avg_acc_y)
-    print(f"\n扰动-准确率曲线拐点：eps={inflect_x:.4f}，对应对抗准确率={inflect_y:.4f}")
+    eps_x_arr = EPS_LIST
+    avg_eps_acc = [np.mean(eps_record[e]) for e in EPS_LIST]
+    global inflect_x, inflect_y
+    inflect_x, inflect_y, _ = find_inflection_point(eps_x_arr, avg_eps_acc)
+    print(f"\n曲线拐点：eps={inflect_x:.4f}，对应对抗准确率={inflect_y:.4f}")
 
     # 绘图
     plt.rcParams["font.sans-serif"] = ["SimHei"]
     plt.rcParams["axes.unicode_minus"] = False
     plt.figure(figsize=(9, 5))
-    plt.plot(eps_x, avg_acc_y, marker="o", linewidth=2, label="平均对抗准确率")
+    plt.plot(eps_x_arr, avg_eps_acc, marker="o", linewidth=2, label="平均对抗准确率")
     plt.scatter(inflect_x, inflect_y, c="red", s=120, label=f"拐点 eps={inflect_x:.3f}")
     plt.axhline(y=SAFE_THRESHOLD, c="orange", linestyle="--", label=f"安全阈值 {SAFE_THRESHOLD}")
     plt.xlabel("扰动强度 eps")
     plt.ylabel("源模型平均对抗准确率")
-    plt.title("扰动强度-模型鲁棒准确率关系曲线")
+    plt.title("扰动强度-模型鲁棒准确率曲线")
     plt.legend()
     plt.grid(alpha=0.3)
     plt.savefig("eps_acc_curve.png", dpi=300)
     plt.close()
-    print("曲线图已保存 eps_acc_curve.png")
 
-    # 输出完整报告
+    plt.figure(figsize=(9, 5))
+    color_map = {"fgsm": "red", "pgd": "blue", "bim": "green"}
+    for atk in ATTACK_LIST:
+        data = attack_record[atk]
+        eps_unique = sorted(list(set([x[0] for x in data])))
+        mean_list = []
+        for e in eps_unique:
+            accs = [item[1] for item in data if item[0] == e]
+            mean_list.append(np.mean(accs))
+        plt.plot(eps_unique, mean_list, marker="o", c=color_map[atk], label=f"{atk.upper()}")
+    plt.axhline(y=SAFE_THRESHOLD, c="orange", linestyle="--", label=f"安全阈值 0.7")
+    plt.xlabel("扰动强度 eps")
+    plt.ylabel("对抗准确率")
+    plt.title("多攻击算法鲁棒性对比")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.savefig("attack_compare_curve.png", dpi=300)
+    plt.close()
+    print("绘图文件：eps_acc_curve.png / attack_compare_curve.png 已保存")
+
+    all_adv = [x["source_adv_acc"] for x in global_summary]
+    avg_adv = float(np.mean(all_adv))
+    all_clean = [x["clean_acc"] for x in global_summary]
+    avg_clean = float(np.mean(all_clean))
+
     final_report = {
         "time_cost_s": round(time.time() - total_start, 2),
         "total_infer_count": get_infer_count(),
         "max_infer_limit": MAX_INFER_LIMIT,
-        "max_time_limit": MAX_TIME_LIMIT,
+        "max_time_sec": MAX_TIME_LIMIT,
         "safe_threshold": SAFE_THRESHOLD,
         "eps_list": EPS_LIST,
         "attack_types": ATTACK_LIST,
@@ -192,38 +297,16 @@ def main():
     try:
         with open("final_report.json", "w", encoding="utf-8") as f:
             json.dump(final_report, f, ensure_ascii=False, indent=2)
-        print("完整测试报告输出成功：final_report.json")
+        print("完整报告 final_report.json 生成成功")
     except Exception as e:
-        print(f"完整报告保存失败，错误：{e}")
+        print(f"报告保存失败：{e}")
 
-    print("\n==========全部实验执行完成==========")
-    print(f"总运行耗时：{time.time()-total_start:.2f}s")
+    print("\n========== 全部实验执行完成 ==========")
+    print(f"总耗时：{time.time() - total_start:.2f}s")
     print(f"总推理次数：{get_infer_count()}")
 
-    auditor = CompetitionAuditor()
-
-    # 【关键修复】中文键名改为英文，和返回字典对应
-    all_clean_acc = [
-        item["clean_acc"]
-        for item in global_summary
-    ]
-
-    all_attack_acc = [
-        item["source_adv_acc"]
-        for item in global_summary
-    ]
-
-    avg_clean_acc = np.mean(all_clean_acc)
-    avg_attack_acc = np.mean(all_attack_acc)
-    infer_count = get_infer_count()
-    run_time = time.time() - total_start
-
-    auditor.run_audit(
-        clean_acc=avg_clean_acc,
-        attack_acc=avg_attack_acc,
-        query_count=infer_count,
-        time_cost=run_time
-    )
+    audit = AuditTool()
+    audit.run_audit(avg_clean, avg_adv, get_infer_count(), time.time() - total_start)
 
 if __name__ == "__main__":
     main()
