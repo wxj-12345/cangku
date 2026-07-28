@@ -22,7 +22,7 @@ if torch.cuda.is_available():
 
 # 全局资源约束
 MAX_INFER_LIMIT = 1000
-MAX_TIME_LIMIT = 400
+MAX_TIME_LIMIT = 500
 TEST_ROUND = 1
 SAFE_THRESHOLD = 0.7
 EPS_LIST = [0.01, 0.03, 0.05, 0.08, 0.10]
@@ -62,7 +62,7 @@ def adv_finetune(model, target_model, loader, device, epoch=1, max_batch=33):
         lr=8e-4, momentum=0.9, weight_decay=1e-4
     )
     loss_cls, loss_mse = nn.CrossEntropyLoss(), nn.MSELoss()
-    train_eps_candidates = [0.01, 0.03, 0.05, 0.05, 0.08, 0.08, 0.08, 0.10, 0.10, 0.10]
+    train_eps_candidates = [0.05, 0.05, 0.08, 0.08, 0.08, 0.08, 0.10, 0.10, 0.10, 0.10]
     train_blur = T.GaussianBlur((5,5), sigma=(0.8,1.2))
     total_batch = len(loader)
     print(f"\n===== 鲁棒微调启动，最大训练批次{max_batch} =====")
@@ -107,7 +107,7 @@ def adv_finetune(model, target_model, loader, device, epoch=1, max_batch=33):
             loss_mig_adv = loss_mse(out_adv_src, out_adv_tgt)
 
             # ========== 关键修改：强化高eps FGSM权重 ==========
-            total_loss = loss_clean + 6.0 * loss_align_clean + 42.0 * loss_adv_src + 14.0 * loss_mig_adv
+            total_loss = loss_clean + 1.5 * loss_align_clean + 82.0 * loss_adv_src + 13.0 * loss_mig_adv
             total_loss.backward()
             opt.step()
             batch_count += 1
@@ -169,7 +169,7 @@ def main():
     raw_model = resnet50(weights=ResNet50_Weights.DEFAULT).to(device).eval()
     target_model = resnet50(weights=ResNet50_Weights.DEFAULT).to(device).eval()
     test_loader = load_cifar10(batch_size=BATCH_SIZE)
-    adv_finetune(raw_model, target_model, test_loader, device, epoch=1, max_batch=40)
+    adv_finetune(raw_model, target_model, test_loader, device, epoch=1, max_batch=33)
 
     print("\n预加载全部测试样本至内存...")
     all_data = []
@@ -203,6 +203,10 @@ def main():
                     global_summary.append(res_data)
                     eps_record[eps].append(res_data["source_adv_acc"])
                     attack_record[attack_name].append((eps, res_data["source_adv_acc"], res_data["migrate_retention"]))
+                    # ===================== 新增打印：每组攻击推理完成，输出当前总推理次数 =====================
+                    current_infer = get_infer_count()
+                    print(f"【单组攻击完成】eps={eps} {attack_name.upper()} 结束，当前累计推理总次数：{current_infer}")
+                    # =====================================================================================
 
     # 汇总打印
     print("\n" + "=" * 60)
