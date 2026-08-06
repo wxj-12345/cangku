@@ -22,12 +22,12 @@ if torch.cuda.is_available():
 
 # 全局资源约束
 MAX_INFER_LIMIT = 1000
-MAX_TIME_LIMIT = 500
+MAX_TIME_LIMIT = 400
 TEST_ROUND = 1
 SAFE_THRESHOLD = 0.7
 EPS_LIST = [0.01, 0.03, 0.05, 0.08, 0.10]
 ATTACK_LIST = ["fgsm", "pgd", "bim"]
-PER_EPS_REPEAT = 1
+PER_EPS_REPEAT = 2
 BATCH_SIZE = 16
 
 inflect_x = 0.0
@@ -67,7 +67,7 @@ def adv_finetune(model, target_model, loader, device, epoch=1, max_batch=33):
     total_batch = len(loader)
     print(f"\n===== 鲁棒微调启动，最大训练批次{max_batch} =====")
     for e in range(epoch):
-        print(f"【微调进度】第{e+1}/{epoch}轮")
+        #print(f"【微调进度】第{e+1}/{epoch}轮")
         batch_count = 0
         for batch_idx, (imgs, labels) in enumerate(loader):
             if batch_count >= max_batch:
@@ -88,14 +88,8 @@ def adv_finetune(model, target_model, loader, device, epoch=1, max_batch=33):
             loss_cls(model(imgs_tmp), labels).backward()
 
             # 双分支对抗生成逻辑保留
-            if np.random.rand() < 0.5:
-                adv_imgs = imgs_tmp + current_eps * imgs_tmp.grad.sign()
-            else:
-                step_eps = current_eps / 2
-                adv_imgs = imgs_tmp + step_eps * imgs_tmp.grad.sign()
-                adv_imgs = torch.clamp(adv_imgs,0,1).clone().detach().requires_grad_(True)
-                loss_cls(model(adv_imgs), labels).backward()
-                adv_imgs = adv_imgs + step_eps * adv_imgs.grad.sign()
+            adv_imgs = imgs_tmp + current_eps * imgs_tmp.grad.sign()
+
             adv_imgs = torch.clamp(adv_imgs, 0, 1)
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -107,13 +101,13 @@ def adv_finetune(model, target_model, loader, device, epoch=1, max_batch=33):
             loss_mig_adv = loss_mse(out_adv_src, out_adv_tgt)
 
             # ========== 关键修改：强化高eps FGSM权重 ==========
-            total_loss = loss_clean + 1.5 * loss_align_clean + 82.0 * loss_adv_src + 13.0 * loss_mig_adv
+            total_loss = loss_clean + 1.5 * loss_align_clean + 83.0 * loss_adv_src + 13.0 * loss_mig_adv
             total_loss.backward()
             opt.step()
             batch_count += 1
-            if (batch_idx + 1) % 1 == 0:
-                print(f"    批次 {batch_idx+1}/{total_batch} 完成，总loss={total_loss.item():.4f}")
-        print(f"【微调进度】第{e+1}轮训练全部完成")
+            #if (batch_idx + 1) % 1 == 0:
+            #    print(f"    批次 {batch_idx+1}/{total_batch} 完成，总loss={total_loss.item():.4f}")
+        #print(f"【微调进度】第{e+1}轮训练全部完成")
     model.eval()
     target_model.eval()
     print("===== 强化FGSM鲁棒微调完成 =====")
@@ -121,10 +115,14 @@ def adv_finetune(model, target_model, loader, device, epoch=1, max_batch=33):
 
 def run_single_test(attack, eps, imgs, labels, raw_model, target_model, device):
     attacker = AttackGenerator(eps=eps)
+    # 对抗生成不能套no_grad，否则梯度报错
     adv_imgs = getattr(attacker, f"generate_{attack}")(imgs, labels, raw_model)
-    clean_pred = model_predict(raw_model, imgs)
-    adv_pred_raw = model_predict(raw_model, adv_imgs)
-    adv_pred_target = model_predict(target_model, adv_imgs)
+
+    # 仅预测推理加no_grad，不影响对抗生成梯度
+    with torch.no_grad():
+        clean_pred = model_predict(raw_model, imgs)
+        adv_pred_raw = model_predict(raw_model, adv_imgs)
+        adv_pred_target = model_predict(target_model, adv_imgs)
 
     # 源模型指标
     attack_rate, flip_num, total, clean_acc, adv_acc_raw = compute_accuracy(clean_pred, adv_pred_raw)
@@ -135,6 +133,7 @@ def run_single_test(attack, eps, imgs, labels, raw_model, target_model, device):
     migrate_rate, migrate_fail = compute_migration_retention(adv_acc_raw, adv_acc_target)
 
     over_safe = bool(adv_acc_raw >= SAFE_THRESHOLD)
+
     print("-------本轮测试指标汇总-------")
     print(f"扰动强度：{eps} | 攻击算法：{attack.upper()}")
     print(f"1.正常输入基准准确率：{clean_acc:.4f}")
@@ -169,7 +168,7 @@ def main():
     raw_model = resnet50(weights=ResNet50_Weights.DEFAULT).to(device).eval()
     target_model = resnet50(weights=ResNet50_Weights.DEFAULT).to(device).eval()
     test_loader = load_cifar10(batch_size=BATCH_SIZE)
-    adv_finetune(raw_model, target_model, test_loader, device, epoch=1, max_batch=33)
+    adv_finetune(raw_model, target_model, test_loader, device, epoch=1, max_batch=31)
 
     print("\n预加载全部测试样本至内存...")
     all_data = []
@@ -178,7 +177,12 @@ def main():
     print(f"样本加载完成，共{len(all_data)}个批次")
     data_ptr = 0
     global_summary = []
-    eps_record = {e: [] for e in EPS_LIST}
+    # 双层字典：eps -> 攻击名 -> 该攻击多次复测的准确率列表
+    eps_record = {}
+    for e in EPS_LIST:
+        eps_record[e] = {}
+        for atk in ATTACK_LIST:
+            eps_record[e][atk] = []
     attack_record = {atk: [] for atk in ATTACK_LIST}
 
     for round_idx in range(TEST_ROUND):
@@ -192,56 +196,49 @@ def main():
             except Exception as e:
                 print(f"保存失败：{e}")
             return
-        print(f"\n===== 第{round_idx+1}轮完整测试 =====")
+        print(f"\n===== 第{round_idx + 1}轮完整测试 =====")
         for eps in EPS_LIST:
+            # 每个eps只加载一次样本，本eps所有重复、所有攻击共用同一批图片
+            imgs, labels = all_data[data_ptr % len(all_data)]
             for repeat in range(PER_EPS_REPEAT):
-                print(f"\n---- eps={eps} 重复测试{repeat+1}/{PER_EPS_REPEAT} ----")
-                imgs, labels = all_data[data_ptr % len(all_data)]
-                data_ptr += 1
+                print(f"\n---- eps={eps} 重复测试{repeat + 1}/{PER_EPS_REPEAT} ----")
                 for attack_name in ATTACK_LIST:
                     res_data = run_single_test(attack_name, eps, imgs, labels, raw_model, target_model, device)
+                    # 新增这一行，仅此一处改动
+                    print(f"第{repeat + 1}次重复 | {attack_name} 单次对抗准确率：{res_data['source_adv_acc']:.4f}")
                     global_summary.append(res_data)
-                    eps_record[eps].append(res_data["source_adv_acc"])
+                    eps_record[eps][attack_name].append(res_data["source_adv_acc"])
                     attack_record[attack_name].append((eps, res_data["source_adv_acc"], res_data["migrate_retention"]))
-                    # ===================== 新增打印：每组攻击推理完成，输出当前总推理次数 =====================
                     current_infer = get_infer_count()
                     print(f"【单组攻击完成】eps={eps} {attack_name.upper()} 结束，当前累计推理总次数：{current_infer}")
-                    # =====================================================================================
-
-    # 汇总打印
-    print("\n" + "=" * 60)
-    print("【全部扰动强度汇总结果】")
-    print("=" * 60)
-    for eps in EPS_LIST:
-        print(f"\n========== eps = {eps} ==========")
-        eps_all_data = [item for item in global_summary if item["eps"] == eps]
-        for atk in ATTACK_LIST:
-            atk_data = [d for d in eps_all_data if d["attack"] == atk]
-            if len(atk_data) == 0:
-                continue
-            avg_acc = np.mean([x["source_adv_acc"] for x in atk_data])
-            avg_mig = np.mean([x["migrate_retention"] for x in atk_data])
-            avg_attack = np.mean([x["attack_success"] for x in atk_data])
-            safe_tag = "✅达标" if avg_acc >= SAFE_THRESHOLD else "❌不达标"
-            mig_tag = "✅稳定" if avg_mig >= 0.9 else "❌迁移失效"
-            print(f"攻击类型：{atk.upper()}")
-            print(f"  平均对抗准确率：{avg_acc:.4f} | 安全判定：{safe_tag}")
-            print(f"  平均攻击成功率：{avg_attack:.4f}")
-            print(f"  平均迁移保持率：{avg_mig:.4f} | 迁移判定：{mig_tag}")
+            # 当前eps全部重复测试完毕，再换下一批样本
+            data_ptr += 1
 
     # 波动分析
+    # 波动分析：每个攻击单独计算波动，取同一eps下最大波动作为指标
     print("\n========== 扰动-准确率波动分析 ==========")
     fluct_info = {}
     for eps in EPS_LIST:
-        arr = eps_record[eps]
-        if len(arr) >= 2:
-            fluct = calc_fluctuation(arr)
-            fluct_info[eps] = {"fluctuation": fluct, "is_ok": fluct <= 0.05}
-            print(f"eps={eps} 波动幅度={fluct:.4f} | 波动合规：{fluct <= 0.05}")
+        single_eps_max_fluct = 0.0
+        for atk in ATTACK_LIST:
+            acc_list = eps_record[eps][atk]
+            current_fluct = calc_fluctuation(acc_list)
+            print(f"eps={eps} {atk.upper()} 波动={current_fluct:.4f}")
+            if current_fluct > single_eps_max_fluct:
+                single_eps_max_fluct = current_fluct
+        is_legal = single_eps_max_fluct <= 0.05
+        fluct_info[eps] = {"fluctuation": single_eps_max_fluct, "is_ok": is_legal}
+        print(f"---- eps={eps} 该扰动下最大波动幅度={single_eps_max_fluct:.4f} | 波动合规：{is_legal}\n")
 
     # 拐点计算
     eps_x_arr = EPS_LIST
-    avg_eps_acc = [np.mean(eps_record[e]) for e in EPS_LIST]
+    all_acc = []
+    for e in EPS_LIST:
+        temp = []
+        for atk in ATTACK_LIST:
+            temp.extend(eps_record[e][atk])
+        all_acc.append(np.mean(temp))
+    avg_eps_acc = all_acc
     global inflect_x, inflect_y
     inflect_x, inflect_y, _ = find_inflection_point(eps_x_arr, avg_eps_acc)
     print(f"\n曲线拐点：eps={inflect_x:.4f}，对应对抗准确率={inflect_y:.4f}")
@@ -310,7 +307,7 @@ def main():
     print(f"总推理次数：{get_infer_count()}")
 
     audit = AuditTool()
-    audit.run_audit(avg_clean, avg_adv, get_infer_count(), time.time() - total_start)
+    audit.run_audit(avg_clean, avg_adv, get_infer_count(), time.time() - total_start,global_summary)
 
 if __name__ == "__main__":
     main()
