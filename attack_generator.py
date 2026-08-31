@@ -36,7 +36,7 @@ class AttackGenerator:
 
     def generate_bim(self, imgs, labels, model):
         m = self._wrap_model(model)
-        bim = fb.attacks.LinfBasicIterativeAttack(steps=1)
+        bim = fb.attacks.LinfBasicIterativeAttack(steps=1,random_start=False)
         _, img_adv, _ = bim(m, imgs, labels, epsilons=self.eps)
         self._restore_model(model)
         return img_adv.detach()

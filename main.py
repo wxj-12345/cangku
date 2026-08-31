@@ -22,7 +22,7 @@ if torch.cuda.is_available():
 
 # 全局资源约束
 MAX_INFER_LIMIT = 1000
-MAX_TIME_LIMIT = 400
+MAX_TIME_LIMIT = 500
 TEST_ROUND = 1
 SAFE_THRESHOLD = 0.7
 EPS_LIST = [0.01, 0.03, 0.05, 0.08, 0.10]
